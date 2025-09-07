@@ -1,0 +1,249 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Cloud Resume Challenge Backend
+  
+  Serverless application for visitor counter functionality
+  using API Gateway, Lambda, and DynamoDB
+
+# More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
+Globals:
+  Function:
+    Timeout: 3
+    MemorySize: 128
+    Runtime: python3.9
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref VisitorCountTable
+    Tags:
+      Project: CloudResumeChallenge
+      Environment: Production
+
+Parameters:
+  # Environment parameter
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues:
+      - dev
+      - prod
+    Description: Environment name
+  
+  # Domain name parameter (optional)
+  DomainName:
+    Type: String
+    Default: ""
+    Description: Custom domain name for the API (optional)
+
+Conditions:
+  HasDomainName: !Not [!Equals [!Ref DomainName, ""]]
+
+Resources:
+  # DynamoDB Table for visitor count
+  VisitorCountTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "visitor-count-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: CloudResumeChallenge
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: VisitorCountStorage
+
+  # Lambda Function for visitor count API
+  VisitorCountFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "visitor-count-${Environment}"
+      CodeUri: ../backend/
+      Handler: app.lambda_handler
+      Description: "Lambda function to handle visitor count operations"
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref VisitorCountTable
+      Events:
+        # GET endpoint to retrieve visitor count
+        GetVisitorCount:
+          Type: Api
+          Properties:
+            Path: /visitor-count
+            Method: get
+            RestApiId: !Ref VisitorCountApi
+        # POST endpoint to increment visitor count
+        IncrementVisitorCount:
+          Type: Api
+          Properties:
+            Path: /visitor-count
+            Method: post
+            RestApiId: !Ref VisitorCountApi
+        # OPTIONS endpoint for CORS
+        OptionsVisitorCount:
+          Type: Api
+          Properties:
+            Path: /visitor-count
+            Method: options
+            RestApiId: !Ref VisitorCountApi
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref VisitorCountTable
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: '*'
+      Tags:
+        Project: CloudResumeChallenge
+        Environment: !Ref Environment
+
+  # API Gateway
+  VisitorCountApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "visitor-count-api-${Environment}"
+      StageName: !Ref Environment
+      Cors:
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+        AllowOrigin: "'*'"
+      GatewayResponses:
+        DEFAULT_4XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+        DEFAULT_5XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+      Tags:
+        Project: CloudResumeChallenge
+        Environment: !Ref Environment
+
+  # Custom Domain (conditional)
+  ApiDomain:
+    Type: AWS::ApiGateway::DomainName
+    Condition: HasDomainName
+    Properties:
+      DomainName: !Ref DomainName
+      CertificateArn: !Ref SSLCertificate
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # SSL Certificate for custom domain (conditional)
+  SSLCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: HasDomainName
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      Tags:
+        - Key: Project
+          Value: CloudResumeChallenge
+
+  # API Gateway Base Path Mapping (conditional)
+  ApiBasePathMapping:
+    Type: AWS::ApiGateway::BasePathMapping
+    Condition: HasDomainName
+    Properties:
+      DomainName: !Ref ApiDomain
+      RestApiId: !Ref VisitorCountApi
+      Stage: !Ref Environment
+
+  # CloudWatch Log Group for Lambda
+  VisitorCountLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/visitor-count-${Environment}"
+      RetentionInDays: 14
+
+  # IAM Role for Lambda (more explicit permissions)
+  VisitorCountRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "visitor-count-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DescribeTable
+                Resource: !GetAtt VisitorCountTable.Arn
+      Tags:
+        - Key: Project
+          Value: CloudResumeChallenge
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  # API Gateway URL
+  VisitorCountApiUrl:
+    Description: "API Gateway endpoint URL for visitor count API"
+    Value: !Sub "https://${VisitorCountApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/visitor-count"
+    Export:
+      Name: !Sub "${AWS::StackName}-ApiUrl"
+
+  # Custom Domain URL (if provided)
+  CustomDomainUrl:
+    Condition: HasDomainName
+    Description: "Custom domain URL for the API"
+    Value: !Sub "https://${DomainName}/visitor-count"
+    Export:
+      Name: !Sub "${AWS::StackName}-CustomDomainUrl"
+
+  # DynamoDB Table Name
+  VisitorCountTableName:
+    Description: "DynamoDB table name for visitor count"
+    Value: !Ref VisitorCountTable
+    Export:
+      Name: !Sub "${AWS::StackName}-TableName"
+
+  # Lambda Function Name
+  VisitorCountFunctionName:
+    Description: "Lambda function name for visitor count"
+    Value: !Ref VisitorCountFunction
+    Export:
+      Name: !Sub "${AWS::StackName}-FunctionName"
+
+  # API Gateway ID
+  VisitorCountApiId:
+    Description: "API Gateway ID"
+    Value: !Ref VisitorCountApi
+    Export:
+      Name: !Sub "${AWS::StackName}-ApiId"
+
+  # CloudFormation Stack ID
+  StackId:
+    Description: "CloudFormation Stack ID"
+    Value: !Ref AWS::StackId
+    Export:
+      Name: !Sub "${AWS::StackName}-StackId"

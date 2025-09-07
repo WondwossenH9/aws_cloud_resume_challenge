@@ -1,0 +1,276 @@
+name: Frontend CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/frontend.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/frontend.yml'
+
+env:
+  AWS_REGION: us-east-1
+  S3_BUCKET: cloud-resume-challenge-website
+  CLOUDFRONT_DISTRIBUTION_ID: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    name: Validate Frontend Code
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Validate HTML
+      run: |
+        echo "Validating HTML structure..."
+        # Check if index.html exists and has basic structure
+        if [ ! -f "frontend/index.html" ]; then
+          echo "❌ index.html not found!"
+          exit 1
+        fi
+        
+        # Basic HTML validation
+        if ! grep -q "<!DOCTYPE html>" frontend/index.html; then
+          echo "❌ Missing DOCTYPE declaration"
+          exit 1
+        fi
+        
+        if ! grep -q "<title>" frontend/index.html; then
+          echo "❌ Missing title tag"
+          exit 1
+        fi
+        
+        if ! grep -q "visitor-count" frontend/index.html; then
+          echo "❌ Missing visitor counter element"
+          exit 1
+        fi
+        
+        echo "✅ HTML validation passed!"
+        
+    - name: Validate CSS
+      run: |
+        echo "Validating CSS..."
+        if [ ! -f "frontend/styles.css" ]; then
+          echo "❌ styles.css not found!"
+          exit 1
+        fi
+        
+        # Check for basic CSS structure
+        if ! grep -q "body" frontend/styles.css; then
+          echo "❌ Missing body styles"
+          exit 1
+        fi
+        
+        echo "✅ CSS validation passed!"
+        
+    - name: Validate JavaScript
+      run: |
+        echo "Validating JavaScript..."
+        if [ ! -f "frontend/script.js" ]; then
+          echo "❌ script.js not found!"
+          exit 1
+        fi
+        
+        # Check for visitor counter functionality
+        if ! grep -q "visitor-count" frontend/script.js; then
+          echo "❌ Missing visitor counter functionality"
+          exit 1
+        fi
+        
+        if ! grep -q "fetch" frontend/script.js; then
+          echo "❌ Missing fetch API usage"
+          exit 1
+        fi
+        
+        echo "✅ JavaScript validation passed!"
+
+  build:
+    needs: validate
+    runs-on: ubuntu-latest
+    name: Build Frontend
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        
+    - name: Install dependencies (if package.json exists)
+      run: |
+        if [ -f "frontend/package.json" ]; then
+          cd frontend
+          npm ci
+        else
+          echo "No package.json found, skipping npm install"
+        fi
+        
+    - name: Build frontend (if build script exists)
+      run: |
+        if [ -f "frontend/package.json" ] && grep -q '"build"' frontend/package.json; then
+          cd frontend
+          npm run build
+        else
+          echo "No build script found, using static files as-is"
+        fi
+        
+    - name: Update API URL in JavaScript
+      run: |
+        # This will be updated with the actual API URL from backend deployment
+        API_URL="${{ secrets.API_GATEWAY_URL }}"
+        if [ -n "$API_URL" ]; then
+          echo "Updating API URL to: $API_URL"
+          sed -i "s|https://your-api-gateway-url.amazonaws.com/prod|$API_URL|g" frontend/script.js
+        else
+          echo "⚠️ No API URL provided, using placeholder"
+        fi
+        
+    - name: Create deployment package
+      run: |
+        mkdir -p dist
+        cp -r frontend/* dist/
+        echo "Deployment package created"
+        ls -la dist/
+        
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: frontend-build
+        path: dist/
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    name: Deploy to S3 and CloudFront
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Download build artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: frontend-build
+        path: dist/
+        
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Create S3 bucket
+      run: |
+        aws s3 mb s3://${{ env.S3_BUCKET }} --region ${{ env.AWS_REGION }} || true
+        
+    - name: Configure S3 bucket for static website hosting
+      run: |
+        aws s3 website s3://${{ env.S3_BUCKET }} \
+          --index-document index.html \
+          --error-document index.html
+          
+    - name: Set S3 bucket policy for public read access
+      run: |
+        cat > bucket-policy.json << EOF
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "PublicReadGetObject",
+              "Effect": "Allow",
+              "Principal": "*",
+              "Action": "s3:GetObject",
+              "Resource": "arn:aws:s3:::${{ env.S3_BUCKET }}/*"
+            }
+          ]
+        }
+        EOF
+        
+        aws s3api put-bucket-policy \
+          --bucket ${{ env.S3_BUCKET }} \
+          --policy file://bucket-policy.json
+          
+    - name: Upload files to S3
+      run: |
+        aws s3 sync dist/ s3://${{ env.S3_BUCKET }} \
+          --delete \
+          --cache-control "max-age=31536000" \
+          --exclude "*.html" \
+          --exclude "*.css" \
+          --exclude "*.js"
+          
+        # Upload HTML, CSS, and JS with shorter cache time
+        aws s3 sync dist/ s3://${{ env.S3_BUCKET }} \
+          --cache-control "max-age=0, no-cache, no-store, must-revalidate" \
+          --include "*.html" \
+          --include "*.css" \
+          --include "*.js"
+          
+    - name: Get website URL
+      id: get-website-url
+      run: |
+        WEBSITE_URL="http://${{ env.S3_BUCKET }}.s3-website-${{ env.AWS_REGION }}.amazonaws.com"
+        echo "WEBSITE_URL=$WEBSITE_URL" >> $GITHUB_OUTPUT
+        echo "Website URL: $WEBSITE_URL"
+        
+    - name: Invalidate CloudFront cache
+      if: env.CLOUDFRONT_DISTRIBUTION_ID != ''
+      run: |
+        echo "Invalidating CloudFront distribution: ${{ env.CLOUDFRONT_DISTRIBUTION_ID }}"
+        aws cloudfront create-invalidation \
+          --distribution-id ${{ env.CLOUDFRONT_DISTRIBUTION_ID }} \
+          --paths "/*"
+          
+    - name: Test website deployment
+      run: |
+        echo "Testing website at: ${{ steps.get-website-url.outputs.WEBSITE_URL }}"
+        # Test if the website is accessible
+        curl -f "${{ steps.get-website-url.outputs.WEBSITE_URL }}" || exit 1
+        echo "✅ Website deployment test passed!"
+
+  lighthouse:
+    needs: deploy
+    runs-on: ubuntu-latest
+    name: Lighthouse Performance Audit
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Run Lighthouse CI
+      uses: treosh/lighthouse-ci-action@v10
+      with:
+        configPath: './.lighthouserc.json'
+        uploadArtifacts: true
+        temporaryPublicStorage: true
+
+  notify:
+    needs: [deploy, lighthouse]
+    runs-on: ubuntu-latest
+    name: Notify Deployment Status
+    if: always()
+    
+    steps:
+    - name: Notify success
+      if: needs.deploy.result == 'success'
+      run: |
+        echo "✅ Frontend deployment successful!"
+        echo "Website URL: ${{ steps.get-website-url.outputs.WEBSITE_URL }}"
+        
+    - name: Notify failure
+      if: needs.deploy.result == 'failure'
+      run: |
+        echo "❌ Frontend deployment failed!"
+        exit 1

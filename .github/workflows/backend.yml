@@ -1,0 +1,231 @@
+name: Backend CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'backend/**'
+      - 'infrastructure/**'
+      - '.github/workflows/backend.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'backend/**'
+      - 'infrastructure/**'
+      - '.github/workflows/backend.yml'
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: cloud-resume-challenge-backend
+  S3_BUCKET: cloud-resume-challenge-sam-deployments
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    name: Run Tests
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python 3.9
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+        
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('backend/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+          
+    - name: Install dependencies
+      run: |
+        cd backend
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-cov moto boto3
+        
+    - name: Run linting
+      run: |
+        cd backend
+        pip install flake8
+        # Stop the build if there are Python syntax errors or undefined names
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        # Exit-zero treats all errors as warnings
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+        
+    - name: Run tests
+      run: |
+        cd backend
+        python -m pytest tests/ -v --cov=app --cov-report=xml --cov-report=term-missing
+        
+    - name: Upload coverage reports
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./backend/coverage.xml
+        flags: backend
+        name: backend-coverage
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    name: Build and Package
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python 3.9
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+        
+    - name: Install AWS SAM CLI
+      run: |
+        pip install aws-sam-cli
+        
+    - name: Build SAM application
+      run: |
+        cd infrastructure
+        sam build --template template.yaml
+        
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: sam-build-artifacts
+        path: infrastructure/.aws-sam/
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    name: Deploy to AWS
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Download build artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: sam-build-artifacts
+        path: infrastructure/.aws-sam/
+        
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Create S3 bucket for SAM deployments
+      run: |
+        aws s3 mb s3://${{ env.S3_BUCKET }} --region ${{ env.AWS_REGION }} || true
+        
+    - name: Package SAM application
+      run: |
+        cd infrastructure
+        sam package \
+          --template-file .aws-sam/build/template.yaml \
+          --s3-bucket ${{ env.S3_BUCKET }} \
+          --output-template-file packaged-template.yaml
+          
+    - name: Deploy SAM application
+      run: |
+        cd infrastructure
+        sam deploy \
+          --template-file packaged-template.yaml \
+          --stack-name ${{ env.STACK_NAME }} \
+          --capabilities CAPABILITY_IAM \
+          --region ${{ env.AWS_REGION }} \
+          --no-confirm-changeset \
+          --no-fail-on-empty-changeset \
+          --parameter-overrides Environment=prod
+          
+    - name: Get API Gateway URL
+      id: get-api-url
+      run: |
+        API_URL=$(aws cloudformation describe-stacks \
+          --stack-name ${{ env.STACK_NAME }} \
+          --region ${{ env.AWS_REGION }} \
+          --query 'Stacks[0].Outputs[?OutputKey==`VisitorCountApiUrl`].OutputValue' \
+          --output text)
+        echo "API_URL=$API_URL" >> $GITHUB_OUTPUT
+        echo "API Gateway URL: $API_URL"
+        
+    - name: Test deployed API
+      run: |
+        echo "Testing API endpoint: ${{ steps.get-api-url.outputs.API_URL }}"
+        # Test GET request
+        curl -f "${{ steps.get-api-url.outputs.API_URL }}" || exit 1
+        # Test POST request
+        curl -f -X POST "${{ steps.get-api-url.outputs.API_URL }}" || exit 1
+        echo "API tests passed!"
+        
+    - name: Update frontend with API URL
+      run: |
+        # This will be used by the frontend deployment
+        echo "API_URL=${{ steps.get-api-url.outputs.API_URL }}" >> $GITHUB_ENV
+
+  security-scan:
+    needs: test
+    runs-on: ubuntu-latest
+    name: Security Scan
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python 3.9
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+        
+    - name: Install dependencies
+      run: |
+        cd backend
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install bandit safety
+        
+    - name: Run Bandit security scan
+      run: |
+        cd backend
+        bandit -r . -f json -o bandit-report.json || true
+        bandit -r . -f txt
+        
+    - name: Run Safety check
+      run: |
+        cd backend
+        safety check --json --output safety-report.json || true
+        safety check
+        
+    - name: Upload security reports
+      uses: actions/upload-artifact@v3
+      with:
+        name: security-reports
+        path: |
+          backend/bandit-report.json
+          backend/safety-report.json
+
+  notify:
+    needs: [deploy, security-scan]
+    runs-on: ubuntu-latest
+    name: Notify Deployment Status
+    if: always()
+    
+    steps:
+    - name: Notify success
+      if: needs.deploy.result == 'success'
+      run: |
+        echo "✅ Backend deployment successful!"
+        echo "API URL: ${{ env.API_URL }}"
+        
+    - name: Notify failure
+      if: needs.deploy.result == 'failure'
+      run: |
+        echo "❌ Backend deployment failed!"
+        exit 1
