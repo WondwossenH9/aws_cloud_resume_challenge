@@ -2,7 +2,7 @@
 // This script will interact with our API to get and update visitor count
 
 // Configuration - Update this with your actual API Gateway URL
-const API_BASE_URL = 'https://your-api-gateway-url.amazonaws.com/prod';
+const API_BASE_URL = 'https://w0k53mqb44.execute-api.us-east-1.amazonaws.com/prod';
 
 // Function to get visitor count from API
 async function getVisitorCount() {
